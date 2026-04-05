@@ -1,261 +1,455 @@
-# Wedding RSVP - One-command setup for Vercel + Supabase
-# Run from inside the project folder:
-#   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-#   .\setup.ps1
+param()
 
 $ErrorActionPreference = "Stop"
 
-function Write-Header($text) {
+function Write-Step($text) {
     Write-Host ""
-    Write-Host "---------------------------------------------------------" -ForegroundColor Cyan
-    Write-Host "  $text" -ForegroundColor Cyan
-    Write-Host "---------------------------------------------------------" -ForegroundColor Cyan
-    Write-Host ""
+    Write-Host "==================================================" -ForegroundColor Cyan
+    Write-Host $text -ForegroundColor Cyan
+    Write-Host "==================================================" -ForegroundColor Cyan
 }
 
-function Ask($prompt, $default = "") {
-    if ($default -ne "") { $answer = Read-Host "$prompt [$default]" }
-    else                  { $answer = Read-Host "$prompt" }
-    if ($answer -eq "" -and $default -ne "") { return $default }
-    return $answer
+function Write-Info($text) {
+    Write-Host "[INFO] $text" -ForegroundColor Yellow
 }
 
-function AskSecret($prompt) {
-    $s = Read-Host $prompt -AsSecureString
-    return [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-               [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+function Write-Ok($text) {
+    Write-Host "[OK] $text" -ForegroundColor Green
 }
 
-function Check-Cmd($name) {
-    return $null -ne (Get-Command $name -ErrorAction SilentlyContinue)
+function Write-Fail($text) {
+    Write-Host "[ERROR] $text" -ForegroundColor Red
 }
 
-function Ensure-Cli($commandName, $installCommand, $successLabel) {
-    if (Check-Cmd $commandName) {
-        Write-Host "  OK  $successLabel found" -ForegroundColor Green
+function Ask-Required($prompt) {
+    while ($true) {
+        $value = Read-Host $prompt
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value.Trim()
+        }
+        Write-Fail "This value is required."
+    }
+}
+
+function Ask-Optional($prompt) {
+    $value = Read-Host $prompt
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return ""
+    }
+    return $value.Trim()
+}
+
+function Ask-YesNo($prompt, $default = "Y") {
+    while ($true) {
+        $suffix = if ($default -eq "Y") { "[Y/n]" } else { "[y/N]" }
+        $value = Read-Host "$prompt $suffix"
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            return ($default -eq "Y")
+        }
+        switch ($value.Trim().ToLower()) {
+            "y" { return $true }
+            "yes" { return $true }
+            "n" { return $false }
+            "no" { return $false }
+            default { Write-Fail "Please answer y or n." }
+        }
+    }
+}
+
+function Require-Command($name, $installHelp) {
+    if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+        throw "$name is not installed. $installHelp"
+    }
+}
+
+function Ensure-VercelCli {
+    if (-not (Get-Command vercel -ErrorAction SilentlyContinue)) {
+        Write-Info "Vercel CLI not found. Installing it globally now..."
+        npm install -g vercel
+        if (-not (Get-Command vercel -ErrorAction SilentlyContinue)) {
+            throw "Vercel CLI install failed. Run: npm install -g vercel"
+        }
+    }
+}
+
+function Remove-IfExists($path) {
+    if (Test-Path $path) {
+        Remove-Item $path -Recurse -Force
+        Write-Ok "Removed $path"
+    }
+}
+
+function Set-OrReplaceEnvLine([string[]]$lines, [string]$key, [string]$value) {
+    $escaped = [Regex]::Escape($key)
+    $newLine = "$key=$value"
+    $found = $false
+    $result = @()
+
+    foreach ($line in $lines) {
+        if ($line -match "^$escaped=") {
+            $result += $newLine
+            $found = $true
+        } else {
+            $result += $line
+        }
+    }
+
+    if (-not $found) {
+        $result += $newLine
+    }
+
+    return ,$result
+}
+
+function Save-EnvFile($filePath, $pairs) {
+    $lines = @()
+    if (Test-Path $filePath) {
+        $lines = Get-Content $filePath
+    }
+
+    foreach ($key in $pairs.Keys) {
+        $lines = Set-OrReplaceEnvLine -lines $lines -key $key -value $pairs[$key]
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines((Resolve-Path "." ).Path + "\" + $filePath, $lines, $utf8NoBom)
+}
+
+function Add-VercelEnv($name, $value, $targets) {
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        Write-Info "Skipping empty env var: $name"
         return
     }
 
-    Write-Host "  Installing $successLabel..." -ForegroundColor Gray
-    cmd /c $installCommand
-
-    if (-not (Check-Cmd $commandName)) {
-        throw "Failed to install $successLabel"
+    foreach ($target in $targets) {
+        Write-Info "Adding $name to Vercel target: $target"
+        $value | vercel env add $name $target | Out-Null
     }
-
-    Write-Host "  OK  $successLabel installed" -ForegroundColor Green
 }
 
-function Set-EnvEverywhere($name, $value, [switch]$Sensitive) {
-    if ([string]::IsNullOrWhiteSpace($value)) { return }
+function Set-JsonField($jsonPath, $property, $value) {
+    if (-not (Test-Path $jsonPath)) {
+        return
+    }
+    $json = Get-Content $jsonPath -Raw | ConvertFrom-Json
+    $json | Add-Member -NotePropertyName $property -NotePropertyValue $value -Force
+    $json | ConvertTo-Json -Depth 100 | Set-Content $jsonPath -Encoding UTF8
+}
 
-    $tempFile = Join-Path $env:TEMP ("vercel-env-" + [System.Guid]::NewGuid().ToString() + ".txt")
-    Set-Content -Path $tempFile -Value $value -NoNewline
+function Replace-InFile($path, $find, $replace) {
+    if (-not (Test-Path $path)) { return }
+    $content = Get-Content $path -Raw
+    $content = $content -replace $find, $replace
+    Set-Content $path $content -Encoding UTF8
+}
 
-    try {
-        foreach ($environment in @("development", "preview", "production")) {
-            $sensitiveFlag = ""
-            if ($Sensitive) { $sensitiveFlag = " --sensitive" }
+function Ensure-NextConfigMjs {
+    if (Test-Path "next.config.ts") {
+        Remove-Item "next.config.ts" -Force
+        Write-Ok "Removed unsupported next.config.ts"
+    }
 
-            cmd /c "vercel env add $name $environment --force$sensitiveFlag < `"$tempFile`"" | Out-Null
+    if (-not (Test-Path "next.config.mjs")) {
+@"
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  reactStrictMode: true,
+};
+
+export default nextConfig;
+"@ | Set-Content "next.config.mjs" -Encoding UTF8
+        Write-Ok "Created next.config.mjs"
+    }
+}
+
+function Ensure-GitIgnore {
+    $path = ".gitignore"
+    $entries = @(
+        ".env.local",
+        ".env",
+        ".vercel",
+        "node_modules",
+        ".next"
+    )
+
+    $existing = @()
+    if (Test-Path $path) {
+        $existing = Get-Content $path
+    }
+
+    foreach ($entry in $entries) {
+        if ($existing -notcontains $entry) {
+            Add-Content $path $entry
         }
     }
-    finally {
-        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+
+    Write-Ok ".gitignore checked"
+}
+
+function Ensure-PackageJsonScripts {
+    $path = "package.json"
+    if (-not (Test-Path $path)) {
+        throw "package.json not found."
     }
-}
 
-function Remove-PathIfExists($path) {
-    if (Test-Path $path) {
-        Remove-Item $path -Recurse -Force
-        Write-Host "  Removed $path" -ForegroundColor DarkGray
+    $pkg = Get-Content $path -Raw | ConvertFrom-Json
+
+    if (-not $pkg.scripts) {
+        $pkg | Add-Member -MemberType NoteProperty -Name scripts -Value ([pscustomobject]@{})
     }
+
+    $scripts = @{}
+    foreach ($p in $pkg.scripts.PSObject.Properties) {
+        $scripts[$p.Name] = $p.Value
+    }
+
+    if (-not $scripts.ContainsKey("dev")) { $scripts["dev"] = "next dev" }
+    if (-not $scripts.ContainsKey("build")) { $scripts["build"] = "next build" }
+    if (-not $scripts.ContainsKey("start")) { $scripts["start"] = "next start" }
+
+    $pkg.scripts = [pscustomobject]$scripts
+    $pkg | ConvertTo-Json -Depth 100 | Set-Content $path -Encoding UTF8
+
+    Write-Ok "package.json scripts checked"
 }
 
-Clear-Host
-Write-Host ""
-Write-Host "  Wedding RSVP - Vercel Setup Wizard" -ForegroundColor White
-Write-Host ""
-Write-Host "  This script will:" -ForegroundColor Gray
-Write-Host "    - clean out Cloudflare-only leftovers" -ForegroundColor Gray
-Write-Host "    - ask for your wedding and Supabase details" -ForegroundColor Gray
-Write-Host "    - push the code to GitHub" -ForegroundColor Gray
-Write-Host "    - set Vercel environment variables" -ForegroundColor Gray
-Write-Host "    - deploy the site to Vercel" -ForegroundColor Gray
-Write-Host ""
-Write-Host "  You will need:" -ForegroundColor Yellow
-Write-Host "    Node.js 18+       ->  https://nodejs.org" -ForegroundColor Yellow
-Write-Host "    Git               ->  https://git-scm.com" -ForegroundColor Yellow
-Write-Host "    Free Vercel account   ->  https://vercel.com" -ForegroundColor Yellow
-Write-Host "    GitHub account        ->  https://github.com" -ForegroundColor Yellow
-Write-Host "    Supabase project      ->  https://database.new" -ForegroundColor Yellow
-Write-Host ""
-Read-Host "  Press Enter to begin"
-
-Write-Header "Step 1 of 8 - Checking your computer"
-
-$missing = @()
-if (-not (Check-Cmd "node")) { $missing += "  Node.js  ->  https://nodejs.org" }
-if (-not (Check-Cmd "git"))  { $missing += "  Git      ->  https://git-scm.com" }
-
-if ($missing.Count -gt 0) {
-    Write-Host "  The following tools are missing. Please install them and re-run." -ForegroundColor Red
-    $missing | ForEach-Object { Write-Host $_ -ForegroundColor Red }
-    exit 1
+function Ensure-Dependencies {
+    Write-Info "Installing project dependencies..."
+    npm install
+    Write-Ok "Dependencies installed"
 }
 
-Write-Host "  OK  Node.js  $(node --version)" -ForegroundColor Green
-Write-Host "  OK  npm      $(npm --version)" -ForegroundColor Green
-Write-Host "  OK  Git      $(git --version)" -ForegroundColor Green
+function Ensure-RepoConnected($repoUrl) {
+    if (-not (Test-Path ".git")) {
+        git init | Out-Null
+        Write-Ok "Git repository initialized"
+    }
 
-Ensure-Cli "vercel" "npm install -g vercel@latest" "Vercel CLI"
+    git branch -M main | Out-Null
 
-Write-Header "Step 2 of 8 - Cleaning Cloudflare leftovers"
+    $hasOrigin = $false
+    try {
+        $remoteUrl = git remote get-url origin 2>$null
+        if ($LASTEXITCODE -eq 0 -and $remoteUrl) {
+            $hasOrigin = $true
+        }
+    } catch {}
 
-Remove-PathIfExists ".vercel"
-Remove-PathIfExists ".open-next"
-Remove-PathIfExists ".wrangler"
-Remove-PathIfExists ".next"
-Remove-PathIfExists "node_modules"
-Remove-Item "package-lock.json" -Force -ErrorAction SilentlyContinue
-Remove-Item "wrangler.toml" -Force -ErrorAction SilentlyContinue
-Write-Host "  Project cleaned for Vercel deployment" -ForegroundColor Green
-
-Write-Header "Step 3 of 8 - Your wedding details"
-
-$rsvpPrompt   = Ask "  Message shown to guests on the RSVP page" "Please kindly respond for our wedding."
-$rsvpDeadline = Ask "  RSVP deadline (format: YYYY-MM-DDThh:mm:ss)" "2026-12-31T23:59:59"
-$inviteMsg    = Ask "  Opening line of your WhatsApp invite message" "You are warmly invited to our wedding!"
-$adminPass    = AskSecret "  Choose a password for the admin dashboard (hidden as you type)"
-if ($adminPass.Length -lt 6) {
-    Write-Host "  Warning: password is short. Consider making it longer." -ForegroundColor Yellow
-}
-
-Write-Header "Step 4 of 8 - Supabase details"
-
-Write-Host "  Create a Supabase project first if you have not already." -ForegroundColor Gray
-Write-Host "  You need the project URL, publishable/anon key, and service role/secret key." -ForegroundColor Gray
-Write-Host ""
-$publicSupabaseUrl = Ask "  Supabase project URL (https://xxxx.supabase.co)"
-$supabaseUrl = Ask "  Server Supabase URL [press Enter to reuse the same URL]" $publicSupabaseUrl
-$publicSupabaseAnon = AskSecret "  Supabase publishable/anon key"
-$supabaseServiceKey = AskSecret "  Supabase service role/secret key"
-$dbUrl = AskSecret "  Optional Postgres connection string for auto-running schema.sql (or press Enter to skip)"
-
-Write-Header "Step 5 of 8 - Notifications (optional)"
-
-$resendKey   = AskSecret "  Resend API key (or press Enter to skip)"
-$resendFrom  = ""
-$notifyEmail = ""
-if ($resendKey -ne "") {
-    $resendFrom  = Ask "  From address for emails" "noreply@your-domain.com"
-    $notifyEmail = Ask "  Email address(es) to notify, comma-separated"
-}
-
-$waPhone = Ask "  Your WhatsApp number with country code e.g. +14165551234 (or press Enter to skip)"
-$waApiKey = ""
-if ($waPhone -ne "") {
-    $waApiKey = AskSecret "  CallMeBot API key (or press Enter to skip)"
-}
-
-Write-Header "Step 6 of 8 - GitHub repo"
-
-Write-Host "  Create a new empty private GitHub repo in your browser, then paste the URL here." -ForegroundColor Yellow
-$repoUrl = Ask "  GitHub repository URL"
-$projectNameDefault = ($repoUrl -split "/")[-1] -replace "\.git$", ""
-if ($projectNameDefault -eq "") { $projectNameDefault = "wedding-rsvp" }
-$vercelProjectName = Ask "  Vercel project name" $projectNameDefault
-
-Write-Header "Step 7 of 8 - Install, database schema, git push"
-
-npm install
-if ($LASTEXITCODE -ne 0) {
-    throw "npm install failed"
-}
-
-if (-not [string]::IsNullOrWhiteSpace($dbUrl)) {
-    if (Check-Cmd "psql") {
-        Write-Host "  Applying schema.sql with psql..." -ForegroundColor Gray
-        $env:PGPASSWORD = ""
-        cmd /c "psql `"$dbUrl`" -v ON_ERROR_STOP=1 -f schema.sql"
-        Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
-        Write-Host "  OK  schema.sql applied" -ForegroundColor Green
+    if ($hasOrigin) {
+        git remote set-url origin $repoUrl
+        Write-Ok "Updated existing origin remote"
     } else {
-        Write-Host "  Skipping schema.sql auto-run because psql is not installed." -ForegroundColor Yellow
-        Write-Host "  After deployment, run schema.sql in the Supabase SQL Editor once." -ForegroundColor Yellow
+        git remote add origin $repoUrl
+        Write-Ok "Added origin remote"
     }
 }
 
-$ErrorActionPreference = "Continue"
-if (-not (Test-Path ".git")) { git init 2>&1 | Out-Null }
-git add . 2>&1 | Out-Null
-
-$st = git status --short 2>&1 | Out-String
-if ($st.Trim() -ne "") {
-    git commit -m "Vercel-ready RSVP setup" 2>&1 | Out-Null
+function Git-CommitAll($message) {
+    git add .
+    try {
+        git commit -m $message | Out-Null
+        Write-Ok "Git commit created"
+    } catch {
+        Write-Info "No new commit created. Working tree may already be clean."
+    }
 }
 
-$remoteList = git remote 2>&1 | Out-String
-if ($remoteList -match "origin") {
-    git remote set-url origin $repoUrl 2>&1 | Out-Null
+function Ensure-SupabaseClientEnvSample {
+    $path = ".env.example"
+    $pairs = [ordered]@{
+        "NEXT_PUBLIC_SUPABASE_URL"      = "your_supabase_url"
+        "NEXT_PUBLIC_SUPABASE_ANON_KEY" = "your_supabase_anon_key"
+        "SUPABASE_SERVICE_ROLE_KEY"     = "your_supabase_service_role_key"
+        "ADMIN_PASSWORD"                = "your_admin_password"
+        "NEXT_PUBLIC_RSVP_MESSAGE"      = "Please confirm your attendance"
+        "NEXT_PUBLIC_RSVP_DEADLINE"     = "May 3, 2026"
+        "NEXT_PUBLIC_INVITE_MESSAGE"    = "You are invited"
+        "RESEND_API_KEY"                = ""
+        "RESEND_FROM_EMAIL"             = ""
+        "WHATSAPP_PHONE"                = ""
+        "WHATSAPP_API_KEY"              = ""
+        "NEXT_PUBLIC_SITE_URL"          = "https://your-project.vercel.app"
+    }
+    Save-EnvFile -filePath $path -pairs $pairs
+    Write-Ok ".env.example updated"
+}
+
+Write-Step "Wedding RSVP Full Automation Setup"
+
+Write-Host "This script will:"
+Write-Host "1. Clean up leftover files that commonly break Vercel"
+Write-Host "2. Ask you for required project values"
+Write-Host "3. Create or update .env.local"
+Write-Host "4. Install dependencies"
+Write-Host "5. Connect GitHub"
+Write-Host "6. Link and deploy to Vercel"
+Write-Host "7. Add your environment variables to Vercel"
+Write-Host ""
+
+if (-not (Ask-YesNo "Continue?" "Y")) {
+    Write-Host "Cancelled."
+    exit 0
+}
+
+Write-Step "Checking Required Tools"
+Require-Command "node" "Install Node.js from https://nodejs.org"
+Require-Command "npm" "Node.js install should include npm."
+Require-Command "git" "Install Git from https://git-scm.com"
+Ensure-VercelCli
+Write-Ok "All required tools are available"
+
+Write-Step "Collecting Configuration"
+
+$rsvpMessage      = Ask-Required "RSVP message"
+$rsvpDeadline     = Ask-Required "RSVP deadline (example: May 3, 2026)"
+$inviteMessage    = Ask-Required "Invite message"
+$adminPassword    = Ask-Required "Admin password"
+
+Write-Host ""
+Write-Host "Supabase details are required." -ForegroundColor Yellow
+$supabaseUrl      = Ask-Required "Supabase URL"
+$supabaseAnon     = Ask-Required "Supabase anon key"
+$supabaseService  = Ask-Required "Supabase service role key"
+
+Write-Host ""
+Write-Host "Optional email notifications with Resend." -ForegroundColor Yellow
+$resendKey        = Ask-Optional "Resend API key (press Enter to skip)"
+$resendFrom       = Ask-Optional "Resend sender email (press Enter to skip)"
+
+Write-Host ""
+Write-Host "Optional WhatsApp notifications with CallMeBot." -ForegroundColor Yellow
+$whatsAppPhone    = Ask-Optional "WhatsApp phone number with country code (press Enter to skip)"
+$whatsAppApiKey   = Ask-Optional "WhatsApp API key (press Enter to skip)"
+
+Write-Host ""
+$repoUrl          = Ask-Required "GitHub repository URL (empty repo recommended)"
+$projectName      = Ask-Required "Vercel project name"
+$siteUrlGuess     = "https://$projectName.vercel.app"
+
+Write-Host ""
+$deployPreviewToo = Ask-YesNo "Also add env vars to Preview deployments?" "Y"
+$runLocalBuild    = Ask-YesNo "Run a local production build test before pushing?" "Y"
+$pushToGitHub     = Ask-YesNo "Push changes to GitHub automatically?" "Y"
+$deployToVercel   = Ask-YesNo "Deploy to Vercel automatically now?" "Y"
+
+Write-Step "Cleaning Up Project"
+
+$pathsToRemove = @(
+    "wrangler.toml",
+    "_worker.js",
+    "_routes.json",
+    ".wrangler",
+    ".open-next",
+    ".cloudflare",
+    "next.config.ts"
+)
+
+foreach ($path in $pathsToRemove) {
+    Remove-IfExists $path
+}
+
+Ensure-NextConfigMjs
+Ensure-GitIgnore
+Ensure-PackageJsonScripts
+Ensure-SupabaseClientEnvSample
+
+Write-Step "Creating Environment Files"
+
+$envPairs = [ordered]@{
+    "NEXT_PUBLIC_SUPABASE_URL"      = $supabaseUrl
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY" = $supabaseAnon
+    "SUPABASE_SERVICE_ROLE_KEY"     = $supabaseService
+    "ADMIN_PASSWORD"                = $adminPassword
+    "NEXT_PUBLIC_RSVP_MESSAGE"      = $rsvpMessage
+    "NEXT_PUBLIC_RSVP_DEADLINE"     = $rsvpDeadline
+    "NEXT_PUBLIC_INVITE_MESSAGE"    = $inviteMessage
+    "RESEND_API_KEY"                = $resendKey
+    "RESEND_FROM_EMAIL"             = $resendFrom
+    "WHATSAPP_PHONE"                = $whatsAppPhone
+    "WHATSAPP_API_KEY"              = $whatsAppApiKey
+    "NEXT_PUBLIC_SITE_URL"          = $siteUrlGuess
+}
+
+Save-EnvFile -filePath ".env.local" -pairs $envPairs
+Write-Ok ".env.local created or updated"
+
+Write-Step "Installing Dependencies"
+
+if (Ask-YesNo "Delete node_modules and package-lock.json first for a clean install?" "Y") {
+    Remove-IfExists "node_modules"
+    Remove-IfExists "package-lock.json"
+}
+
+Ensure-Dependencies
+
+Write-Step "Optional Local Build Check"
+
+if ($runLocalBuild) {
+    Write-Info "Running npm run build..."
+    npm run build
+    Write-Ok "Local build passed"
 } else {
-    git remote add origin $repoUrl 2>&1 | Out-Null
+    Write-Info "Skipped local build check"
 }
 
-git branch -M main 2>&1 | Out-Null
-$pushOut = git push -u origin main 2>&1 | Out-String
-Write-Host $pushOut -ForegroundColor Gray
-$ErrorActionPreference = "Stop"
+Write-Step "Git Setup"
 
-Write-Host "  OK  Code pushed to GitHub" -ForegroundColor Green
+Ensure-RepoConnected $repoUrl
+Git-CommitAll "Automated Vercel setup and environment configuration"
 
-Write-Header "Step 8 of 8 - Vercel login, env vars, and deploy"
-
-Write-Host "  A browser may open for Vercel login." -ForegroundColor Gray
-cmd /c "vercel login"
-cmd /c "vercel link --yes --project $vercelProjectName"
-
-Set-EnvEverywhere "NEXT_PUBLIC_RSVP_PROMPT" $rsvpPrompt
-Set-EnvEverywhere "NEXT_PUBLIC_RSVP_DEADLINE" $rsvpDeadline
-Set-EnvEverywhere "NEXT_PUBLIC_INVITE_MESSAGE" $inviteMsg
-Set-EnvEverywhere "ADMIN_PASSWORD" $adminPass -Sensitive
-Set-EnvEverywhere "NEXT_PUBLIC_SUPABASE_URL" $publicSupabaseUrl
-Set-EnvEverywhere "SUPABASE_URL" $supabaseUrl
-Set-EnvEverywhere "NEXT_PUBLIC_SUPABASE_ANON_KEY" $publicSupabaseAnon -Sensitive
-Set-EnvEverywhere "SUPABASE_SERVICE_ROLE_KEY" $supabaseServiceKey -Sensitive
-
-if ($resendKey -ne "")   { Set-EnvEverywhere "RESEND_API_KEY" $resendKey -Sensitive }
-if ($resendFrom -ne "")  { Set-EnvEverywhere "RESEND_FROM_EMAIL" $resendFrom }
-if ($notifyEmail -ne "") { Set-EnvEverywhere "NOTIFY_EMAIL" $notifyEmail }
-if ($waPhone -ne "")     { Set-EnvEverywhere "WHATSAPP_NOTIFY_PHONE" $waPhone }
-if ($waApiKey -ne "")    { Set-EnvEverywhere "WHATSAPP_NOTIFY_API_KEY" $waApiKey -Sensitive }
-
-Write-Host "  Creating first production deployment..." -ForegroundColor Gray
-$firstDeployUrl = (cmd /c "vercel --prod --yes") | Select-Object -Last 1
-$firstDeployUrl = "$firstDeployUrl".Trim()
-
-if ([string]::IsNullOrWhiteSpace($firstDeployUrl)) {
-    $firstDeployUrl = Ask "  Paste the deployed Vercel URL"
+if ($pushToGitHub) {
+    Write-Info "Pushing to GitHub..."
+    git push -u origin main
+    Write-Ok "Pushed to GitHub"
+} else {
+    Write-Info "Skipped GitHub push"
 }
 
-Set-EnvEverywhere "NEXT_PUBLIC_SITE_URL" $firstDeployUrl
+Write-Step "Vercel Setup"
 
-Write-Host "  Redeploying so NEXT_PUBLIC_SITE_URL is baked into the client build..." -ForegroundColor Gray
-$finalDeployUrl = (cmd /c "vercel --prod --yes") | Select-Object -Last 1
-$finalDeployUrl = "$finalDeployUrl".Trim()
-if ([string]::IsNullOrWhiteSpace($finalDeployUrl)) {
-    $finalDeployUrl = $firstDeployUrl
+if ($deployToVercel) {
+    Write-Info "You may be asked to log in to Vercel in the browser."
+    vercel login
+    vercel link --yes --project $projectName
+
+    $targets = @("production")
+    if ($deployPreviewToo) {
+        $targets += "preview"
+    }
+
+    Add-VercelEnv "NEXT_PUBLIC_SUPABASE_URL" $supabaseUrl $targets
+    Add-VercelEnv "NEXT_PUBLIC_SUPABASE_ANON_KEY" $supabaseAnon $targets
+    Add-VercelEnv "SUPABASE_SERVICE_ROLE_KEY" $supabaseService $targets
+    Add-VercelEnv "ADMIN_PASSWORD" $adminPassword $targets
+    Add-VercelEnv "NEXT_PUBLIC_RSVP_MESSAGE" $rsvpMessage $targets
+    Add-VercelEnv "NEXT_PUBLIC_RSVP_DEADLINE" $rsvpDeadline $targets
+    Add-VercelEnv "NEXT_PUBLIC_INVITE_MESSAGE" $inviteMessage $targets
+    Add-VercelEnv "RESEND_API_KEY" $resendKey $targets
+    Add-VercelEnv "RESEND_FROM_EMAIL" $resendFrom $targets
+    Add-VercelEnv "WHATSAPP_PHONE" $whatsAppPhone $targets
+    Add-VercelEnv "WHATSAPP_API_KEY" $whatsAppApiKey $targets
+    Add-VercelEnv "NEXT_PUBLIC_SITE_URL" $siteUrlGuess $targets
+
+    Write-Info "Deploying to Vercel production..."
+    vercel --prod
+    Write-Ok "Vercel deployment started or completed"
+} else {
+    Write-Info "Skipped Vercel deployment"
 }
 
+Write-Step "Supabase Database Reminder"
+
+Write-Host "If your database tables do not exist yet:"
+Write-Host "1. Open Supabase"
+Write-Host "2. Go to SQL Editor"
+Write-Host "3. Run the contents of schema.sql"
 Write-Host ""
-Write-Host "---------------------------------------------------------" -ForegroundColor Green
-Write-Host "  All done! Your Vercel RSVP site is live." -ForegroundColor Green
-Write-Host "---------------------------------------------------------" -ForegroundColor Green
+Write-Host "Your expected site URL is:"
+Write-Host $siteUrlGuess -ForegroundColor Green
 Write-Host ""
-Write-Host "  Your site:    $finalDeployUrl" -ForegroundColor White
-Write-Host "  Admin panel:  $finalDeployUrl/admin" -ForegroundColor White
-Write-Host ""
-Write-Host "  Important:" -ForegroundColor Yellow
-Write-Host "  If you skipped the database connection string or do not have psql," -ForegroundColor Yellow
-Write-Host "  run schema.sql once in the Supabase SQL Editor before using the admin page." -ForegroundColor Yellow
-Write-Host ""
+Write-Host "Admin page:"
+Write-Host "$siteUrlGuess/admin" -ForegroundColor Green
+
+Write-Step "Setup Complete"
+
+Write-Host "Done." -ForegroundColor Green
