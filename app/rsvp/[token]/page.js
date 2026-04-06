@@ -136,7 +136,7 @@ export default function RSVPPage() {
           </div>
 
           <p className="mb-8 text-center text-[15px] text-[#5f5a54] md:text-[17px]">
-            {process.env.NEXT_PUBLIC_RSVP_PROMPT || "Please kindly respond by the deadline."}
+            {process.env.NEXT_PUBLIC_RSVP_PROMPT || "Please kindly respond for the Shaadi of Barkah and Uzair by June 20th 2026."}
           </p>
 
           <div className="mb-8 rounded-[28px] border border-[#ebe6de] bg-[#fcfbf8] px-6 py-8 text-center shadow-[inset_0_0_0_1px_rgba(255,255,255,0.3)]">
