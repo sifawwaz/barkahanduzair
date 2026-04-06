@@ -1,12 +1,12 @@
-﻿{
+{
     "name":  "wedding-rsvp",
     "version":  "0.1.0",
     "private":  true,
     "scripts":  {
-                    "lint":  "eslint",
+                    "start":  "next start",
                     "build":  "next build",
                     "dev":  "next dev",
-                    "start":  "next start"
+                    "lint":  "eslint"
                 },
     "dependencies":  {
                          "@supabase/supabase-js":  "^2.56.1",

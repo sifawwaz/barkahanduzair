@@ -79,6 +79,24 @@ function Remove-IfExists($path) {
     }
 }
 
+function Write-NoBOM($path, $content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $fullPath = Join-Path (Resolve-Path ".").Path $path
+    [System.IO.File]::WriteAllText($fullPath, $content, $utf8NoBom)
+}
+
+function Fix-BOM($file) {
+    if (-not (Test-Path $file)) {
+        return
+    }
+
+    $content = Get-Content $file -Raw
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $fullPath = (Resolve-Path $file).Path
+    [System.IO.File]::WriteAllText($fullPath, $content, $utf8NoBom)
+    Write-Ok "Encoding fixed: $file"
+}
+
 function Set-OrReplaceEnvLine([string[]]$lines, [string]$key, [string]$value) {
     $escaped = [Regex]::Escape($key)
     $newLine = "$key=$value"
@@ -103,6 +121,7 @@ function Set-OrReplaceEnvLine([string[]]$lines, [string]$key, [string]$value) {
 
 function Save-EnvFile($filePath, $pairs) {
     $lines = @()
+
     if (Test-Path $filePath) {
         $lines = Get-Content $filePath
     }
@@ -111,8 +130,8 @@ function Save-EnvFile($filePath, $pairs) {
         $lines = Set-OrReplaceEnvLine -lines $lines -key $key -value $pairs[$key]
     }
 
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllLines((Resolve-Path "." ).Path + "\" + $filePath, $lines, $utf8NoBom)
+    $content = ($lines -join "`n")
+    Write-NoBOM $filePath $content
 }
 
 function Add-VercelEnv($name, $value, $targets) {
@@ -122,25 +141,30 @@ function Add-VercelEnv($name, $value, $targets) {
     }
 
     foreach ($target in $targets) {
-        Write-Info "Adding $name to Vercel target: $target"
-        $value | vercel env add $name $target | Out-Null
-    }
-}
+        Write-Info "Setting $name for Vercel target: $target"
 
-function Set-JsonField($jsonPath, $property, $value) {
-    if (-not (Test-Path $jsonPath)) {
-        return
+        try {
+            vercel env rm $name $target -y 2>$null | Out-Null
+        } catch {}
+
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        try {
+            Write-NoBOM $tempFile $value
+            Get-Content $tempFile | vercel env add $name $target | Out-Null
+            Write-Ok "$name added to $target"
+        } finally {
+            if (Test-Path $tempFile) {
+                Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
-    $json = Get-Content $jsonPath -Raw | ConvertFrom-Json
-    $json | Add-Member -NotePropertyName $property -NotePropertyValue $value -Force
-    $json | ConvertTo-Json -Depth 100 | Set-Content $jsonPath -Encoding UTF8
 }
 
 function Replace-InFile($path, $find, $replace) {
     if (-not (Test-Path $path)) { return }
     $content = Get-Content $path -Raw
     $content = $content -replace $find, $replace
-    Set-Content $path $content -Encoding UTF8
+    Write-NoBOM $path $content
 }
 
 function Ensure-NextConfigMjs {
@@ -149,16 +173,20 @@ function Ensure-NextConfigMjs {
         Write-Ok "Removed unsupported next.config.ts"
     }
 
-    if (-not (Test-Path "next.config.mjs")) {
-@"
+    $config = @"
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
 };
 
 export default nextConfig;
-"@ | Set-Content "next.config.mjs" -Encoding UTF8
+"@
+
+    if (-not (Test-Path "next.config.mjs")) {
+        Write-NoBOM "next.config.mjs" $config
         Write-Ok "Created next.config.mjs"
+    } else {
+        Fix-BOM "next.config.mjs"
     }
 }
 
@@ -183,6 +211,7 @@ function Ensure-GitIgnore {
         }
     }
 
+    Fix-BOM $path
     Write-Ok ".gitignore checked"
 }
 
@@ -191,6 +220,8 @@ function Ensure-PackageJsonScripts {
     if (-not (Test-Path $path)) {
         throw "package.json not found."
     }
+
+    Fix-BOM $path
 
     $pkg = Get-Content $path -Raw | ConvertFrom-Json
 
@@ -208,7 +239,9 @@ function Ensure-PackageJsonScripts {
     if (-not $scripts.ContainsKey("start")) { $scripts["start"] = "next start" }
 
     $pkg.scripts = [pscustomobject]$scripts
-    $pkg | ConvertTo-Json -Depth 100 | Set-Content $path -Encoding UTF8
+
+    $content = $pkg | ConvertTo-Json -Depth 100
+    Write-NoBOM $path $content
 
     Write-Ok "package.json scripts checked"
 }
@@ -270,8 +303,19 @@ function Ensure-SupabaseClientEnvSample {
         "WHATSAPP_API_KEY"              = ""
         "NEXT_PUBLIC_SITE_URL"          = "https://your-project.vercel.app"
     }
+
     Save-EnvFile -filePath $path -pairs $pairs
     Write-Ok ".env.example updated"
+}
+
+function Validate-PackageJson {
+    Write-Info "Validating package.json..."
+    try {
+        Get-Content "package.json" -Raw | ConvertFrom-Json | Out-Null
+        Write-Ok "package.json is valid"
+    } catch {
+        throw "package.json is invalid JSON."
+    }
 }
 
 Write-Step "Wedding RSVP Full Automation Setup"
@@ -330,7 +374,6 @@ Write-Host ""
 $deployPreviewToo = Ask-YesNo "Also add env vars to Preview deployments?" "Y"
 $runLocalBuild    = Ask-YesNo "Run a local production build test before pushing?" "Y"
 $pushToGitHub     = Ask-YesNo "Push changes to GitHub automatically?" "Y"
-$deployToVercel   = Ask-YesNo "Deploy to Vercel automatically now?" "Y"
 
 Write-Step "Cleaning Up Project"
 
@@ -373,6 +416,15 @@ $envPairs = [ordered]@{
 Save-EnvFile -filePath ".env.local" -pairs $envPairs
 Write-Ok ".env.local created or updated"
 
+Write-Step "Fixing Encoding"
+
+Fix-BOM "package.json"
+Fix-BOM ".env.local"
+Fix-BOM ".env.example"
+Fix-BOM "next.config.mjs"
+
+Validate-PackageJson
+
 Write-Step "Installing Dependencies"
 
 if (Ask-YesNo "Delete node_modules and package-lock.json first for a clean install?" "Y") {
@@ -407,35 +459,31 @@ if ($pushToGitHub) {
 
 Write-Step "Vercel Setup"
 
-if ($deployToVercel) {
-    Write-Info "You may be asked to log in to Vercel in the browser."
-    vercel login
-    vercel link --yes --project $projectName
+Write-Info "You may be asked to log in to Vercel in the browser."
+vercel login
+vercel link --yes --project $projectName
 
-    $targets = @("production")
-    if ($deployPreviewToo) {
-        $targets += "preview"
-    }
-
-    Add-VercelEnv "NEXT_PUBLIC_SUPABASE_URL" $supabaseUrl $targets
-    Add-VercelEnv "NEXT_PUBLIC_SUPABASE_ANON_KEY" $supabaseAnon $targets
-    Add-VercelEnv "SUPABASE_SERVICE_ROLE_KEY" $supabaseService $targets
-    Add-VercelEnv "ADMIN_PASSWORD" $adminPassword $targets
-    Add-VercelEnv "NEXT_PUBLIC_RSVP_MESSAGE" $rsvpMessage $targets
-    Add-VercelEnv "NEXT_PUBLIC_RSVP_DEADLINE" $rsvpDeadline $targets
-    Add-VercelEnv "NEXT_PUBLIC_INVITE_MESSAGE" $inviteMessage $targets
-    Add-VercelEnv "RESEND_API_KEY" $resendKey $targets
-    Add-VercelEnv "RESEND_FROM_EMAIL" $resendFrom $targets
-    Add-VercelEnv "WHATSAPP_PHONE" $whatsAppPhone $targets
-    Add-VercelEnv "WHATSAPP_API_KEY" $whatsAppApiKey $targets
-    Add-VercelEnv "NEXT_PUBLIC_SITE_URL" $siteUrlGuess $targets
-
-    Write-Info "Deploying to Vercel production..."
-    vercel --prod
-    Write-Ok "Vercel deployment started or completed"
-} else {
-    Write-Info "Skipped Vercel deployment"
+$targets = @("production")
+if ($deployPreviewToo) {
+    $targets += "preview"
 }
+
+Add-VercelEnv "NEXT_PUBLIC_SUPABASE_URL" $supabaseUrl $targets
+Add-VercelEnv "NEXT_PUBLIC_SUPABASE_ANON_KEY" $supabaseAnon $targets
+Add-VercelEnv "SUPABASE_SERVICE_ROLE_KEY" $supabaseService $targets
+Add-VercelEnv "ADMIN_PASSWORD" $adminPassword $targets
+Add-VercelEnv "NEXT_PUBLIC_RSVP_MESSAGE" $rsvpMessage $targets
+Add-VercelEnv "NEXT_PUBLIC_RSVP_DEADLINE" $rsvpDeadline $targets
+Add-VercelEnv "NEXT_PUBLIC_INVITE_MESSAGE" $inviteMessage $targets
+Add-VercelEnv "RESEND_API_KEY" $resendKey $targets
+Add-VercelEnv "RESEND_FROM_EMAIL" $resendFrom $targets
+Add-VercelEnv "WHATSAPP_PHONE" $whatsAppPhone $targets
+Add-VercelEnv "WHATSAPP_API_KEY" $whatsAppApiKey $targets
+Add-VercelEnv "NEXT_PUBLIC_SITE_URL" $siteUrlGuess $targets
+
+Write-Info "Deploying to Vercel production..."
+vercel --prod
+Write-Ok "Vercel deployment started or completed"
 
 Write-Step "Supabase Database Reminder"
 
@@ -451,5 +499,4 @@ Write-Host "Admin page:"
 Write-Host "$siteUrlGuess/admin" -ForegroundColor Green
 
 Write-Step "Setup Complete"
-
 Write-Host "Done." -ForegroundColor Green
