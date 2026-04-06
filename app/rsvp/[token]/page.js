@@ -7,13 +7,13 @@ export default function RSVPPage() {
   const params = useParams();
   const token = params?.token;
 
-  const CHANGE_DEADLINE = new Date(process.env.NEXT_PUBLIC_RSVP_DEADLINE || "2099-12-31T23:59:59");
+  const CHANGE_DEADLINE = new Date(process.env.NEXT_PUBLIC_RSVP_DEADLINE || "2026-06-20T23:59:59");
 
   const [guest, setGuest] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [status, setStatus] = useState("pending");
-  const [attendingCount, setAttendingCount] = useState(0);
+  // selection: "pending" | "declined" | number (1..maxGuests)
+  const [selection, setSelection] = useState("pending");
   const [successMessage, setSuccessMessage] = useState("");
   const [showSuccess, setShowSuccess] = useState(false);
 
@@ -26,8 +26,14 @@ export default function RSVPPage() {
         if (!res.ok) { setGuest(null); setLoading(false); return; }
         const { data } = await res.json();
         setGuest(data || null);
-        setStatus(data?.rsvp_status || "pending");
-        setAttendingCount(Number(data?.attending_count || 0));
+        // Restore previous selection on load
+        if (data?.rsvp_status === "attending") {
+          setSelection(Number(data.attending_count) || 1);
+        } else if (data?.rsvp_status === "declined") {
+          setSelection("declined");
+        } else {
+          setSelection("pending");
+        }
       } catch (err) {
         console.error(err);
         setGuest(null);
@@ -61,53 +67,34 @@ export default function RSVPPage() {
   const handleSubmit = async () => {
     if (!guest || !changesOpen) return;
 
-    if (status === "pending") {
-      showAnimatedSuccess("Please select an RSVP option first.");
+    if (selection === "pending") {
+      showAnimatedSuccess("Please select an option from the dropdown.");
       return;
     }
 
-    if (status === "attending") {
-      if (attendingCount < 1) { showAnimatedSuccess("Please enter how many guests are attending."); return; }
-      if (attendingCount > maxGuests) { showAnimatedSuccess(`You cannot exceed ${maxGuests} invited guest(s).`); return; }
+    const isAttending = selection !== "declined";
+    const attendingCount = isAttending ? Number(selection) : 0;
+    const rsvp_status = isAttending ? "attending" : "declined";
 
-      setSaving(true);
-      const res = await fetch("/api/guests", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, updates: { rsvp_status: "attending", attending_count: attendingCount } }),
-      });
-      setSaving(false);
+    setSaving(true);
+    const res = await fetch("/api/guests", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, updates: { rsvp_status, attending_count: attendingCount } }),
+    });
+    setSaving(false);
 
-      if (!res.ok) { showAnimatedSuccess("Could not save RSVP. Please try again."); return; }
+    if (!res.ok) { showAnimatedSuccess("Could not save RSVP. Please try again."); return; }
 
-      await notify({ invite_name: guest.invite_name, family: guest.family, rsvp_status: "attending", attending_count: attendingCount, max_guests: maxGuests });
-      setGuest({ ...guest, rsvp_status: "attending", attending_count: attendingCount });
-      showAnimatedSuccess("RSVP submitted successfully.");
-      return;
-    }
-
-    if (status === "declined") {
-      setSaving(true);
-      const res = await fetch("/api/guests", {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, updates: { rsvp_status: "declined", attending_count: 0 } }),
-      });
-      setSaving(false);
-
-      if (!res.ok) { showAnimatedSuccess("Could not save RSVP. Please try again."); return; }
-
-      await notify({ invite_name: guest.invite_name, family: guest.family, rsvp_status: "declined", attending_count: 0, max_guests: maxGuests });
-      setGuest({ ...guest, rsvp_status: "declined", attending_count: 0 });
-      showAnimatedSuccess("RSVP submitted successfully.");
-    }
+    await notify({ invite_name: guest.invite_name, family: guest.family, rsvp_status, attending_count: attendingCount, max_guests: maxGuests });
+    setGuest({ ...guest, rsvp_status, attending_count: attendingCount });
+    showAnimatedSuccess("RSVP submitted successfully.");
   };
 
   const handleChangeResponse = () => {
     if (!changesOpen) return;
     setGuest((prev) => ({ ...prev, rsvp_status: "pending" }));
-    setStatus("pending");
-    setAttendingCount(0);
+    setSelection("pending");
   };
 
   if (loading) {
@@ -172,28 +159,33 @@ export default function RSVPPage() {
           ) : (
             <div className="mx-auto max-w-3xl">
               <div className="mb-6">
-                <label className="mb-3 block text-left text-lg font-medium text-[#2f2a24]">Will you be attending?</label>
-                <select value={status} onChange={(e) => setStatus(e.target.value)}
-                  className="w-full rounded-2xl border border-[#ddd6cc] bg-white px-5 py-4 text-lg text-black outline-none transition focus:border-[#b8a58f]">
+                <label className="mb-3 block text-left text-lg font-medium text-[#2f2a24]">
+                  How many guests will be attending?
+                </label>
+                <select
+                  value={selection}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setSelection(val === "declined" || val === "pending" ? val : Number(val));
+                  }}
+                  className="w-full rounded-2xl border border-[#ddd6cc] bg-white px-5 py-4 text-lg text-black outline-none transition focus:border-[#b8a58f]"
+                >
                   <option value="pending">Select one</option>
-                  <option value="attending">Attending</option>
                   <option value="declined">Not Attending</option>
+                  {Array.from({ length: maxGuests }, (_, i) => i + 1).map((n) => (
+                    <option key={n} value={n}>
+                      {n} {n === 1 ? "Guest" : "Guests"}
+                    </option>
+                  ))}
                 </select>
               </div>
 
-              {status === "attending" && (
-                <div className="mb-6">
-                  <label className="mb-3 block text-left text-lg font-medium text-[#2f2a24]">How many guests will attend?</label>
-                  <input type="number" min="0" max={maxGuests} value={attendingCount}
-                    onChange={(e) => setAttendingCount(Math.max(0, Number(e.target.value) || 0))}
-                    className="w-full rounded-2xl border border-[#ddd6cc] bg-white px-5 py-4 text-lg text-black outline-none transition focus:border-[#b8a58f]" />
-                  <p className="mt-2 text-sm text-[#7c746b]">Total attending: {attendingCount} / {maxGuests}</p>
-                </div>
-              )}
-
               <div className="flex justify-center">
-                <button onClick={handleSubmit} disabled={saving || !changesOpen}
-                  className="rounded-full bg-[#b7a48d] px-10 py-4 text-lg font-semibold text-white shadow-sm transition hover:bg-[#a18d75] disabled:cursor-not-allowed disabled:opacity-60">
+                <button
+                  onClick={handleSubmit}
+                  disabled={saving || !changesOpen}
+                  className="rounded-full bg-[#b7a48d] px-10 py-4 text-lg font-semibold text-white shadow-sm transition hover:bg-[#a18d75] disabled:cursor-not-allowed disabled:opacity-60"
+                >
                   {saving ? "Saving..." : "Submit RSVP"}
                 </button>
               </div>
